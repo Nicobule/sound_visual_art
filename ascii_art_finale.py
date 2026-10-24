@@ -1,0 +1,1771 @@
+"""Converte un'immagine in ASCII art; l'HTML generato reagisce al cursore e al suono.
+
+Nella pagina HTML i segni vicino al cursore si scompigliano e vengono spinti via,
+lasciando una scia che si calma lentamente; un clic crea un'onda d'urto.
+Un pannello permette di regolare il puntatore (raggio, spinta) e lo sfondo
+(velocità, variazione e grandezza dei segni), di salvare il fotogramma corrente come PNG
+e di registrare l'animazione in un video (MP4 o WebM, a seconda del browser).
+
+Il gruppo Suono analizza il microfono o un file audio e fa vibrare l'immagine:
+spettro (ogni colonna trema con la sua frequenza), onda (la forma d'onda di bassi,
+medi e/o alti, a scelta, deforma l'immagine), bassi (un sobbalzo a ogni colpo) e caos (il volume agita i segni).
+
+Dal pannello si può anche caricare un'altra immagine e cambiare la quantità di segni
+(caratteri per riga): l'immagine viene riconvertita direttamente nel browser, per
+questo l'HTML contiene una copia ridotta dell'originale. Il pannello si chiude con
+la × e si riapre con "Controlli".
+
+Il gruppo Stile cambia il modo in cui viene disegnata ogni cella (tasti 1–9, frecce):
+  caratteri: ASCII, Braille (2×4 puntini per carattere), Testo (una frase ripetuta),
+             Contorni (caratteri orientati lungo i bordi), Matrix (pioggia di katakana)
+  forme:     Retino, Dithering, Pixel, Tratteggio, Puntini, Linee ondulate
+Con l'immagine a colori il gruppo Palette la ricolora (fosforo, ambra, duotone,
+Game Boy); il gruppo Effetti finali aggiunge CRT, Glitch e Bloom sopra ogni stile.
+Cursore, suono, slider, PNG e video funzionano con tutti gli stili.
+In alto a destra un riquadro mostra FPS e statistiche (tasto F per nasconderlo).
+Il gruppo Prestazioni limita la densità dei pixel (qualità bassa/media/piena, anche
+automatica); quando niente si muove la pagina smette di ridisegnare.
+
+Uso:
+    python ascii_art_finale.py --color --html risultato.html     (senza foto: la scegli nella pagina)
+    python ascii_art_finale.py foto.jpg
+    python ascii_art_finale.py foto.jpg -w 150 -o risultato.txt
+    python ascii_art_finale.py foto.jpg --color --html risultato.html
+    python ascii_art_finale.py foto.jpg --invert --charset dettagliato
+
+Se il browser blocca il microfono aprendo l'HTML con doppio clic, servilo in locale:
+    python -m http.server 8000
+e apri http://localhost:8000/risultato.html
+"""
+
+import argparse
+import base64
+import io
+import json
+import sys
+from pathlib import Path
+
+from PIL import Image, ImageOps
+
+# Caratteri ordinati dal più "scuro" (denso) al più "chiaro" (vuoto)
+CHARSETS = {
+    "semplice": "@%#*+=-:. ",
+    "dettagliato": "$@B%8&WM#*oahkbdpqwmZO0QLCJUYXzcvunxrjft/\\|()1{}[]?-_+~<>i!lI;:,\"^`'. ",
+    "blocchi": "█▓▒░ ",
+}
+
+# I caratteri del terminale sono circa il doppio più alti che larghi
+CHAR_ASPECT = 0.5
+
+
+def load_image(path, width):
+    img = Image.open(path)
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    height = max(1, round(img.height / img.width * width * CHAR_ASPECT))
+    return img.resize((width, height), Image.LANCZOS)
+
+
+def to_ascii(img, chars, invert=False):
+    """Restituisce una lista di righe; ogni riga è una lista di (carattere, (r, g, b))."""
+    if invert:
+        chars = chars[::-1]
+    gray = img.convert("L")
+    n = len(chars) - 1
+    rows = []
+    for y in range(img.height):
+        row = []
+        for x in range(img.width):
+            lum = gray.getpixel((x, y))
+            row.append((chars[lum * n // 255], img.getpixel((x, y))))
+        rows.append(row)
+    return rows
+
+
+def render_plain(rows):
+    return "\n".join("".join(c for c, _ in row) for row in rows)
+
+
+def render_terminal_color(rows):
+    lines = []
+    for row in rows:
+        line = "".join(f"\x1b[38;2;{r};{g};{b}m{c}" for c, (r, g, b) in row)
+        lines.append(line + "\x1b[0m")
+    return "\n".join(lines)
+
+
+HTML_TEMPLATE = """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>ASCII art</title>
+<style>
+  html, body { margin: 0; height: 100%; background: __BG__; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; cursor: crosshair; }
+  /* Pannello in stile minimal dark */
+  #panel {
+    position: fixed; top: 12px; left: 12px; z-index: 1; width: 210px;
+    max-height: calc(100vh - 54px); overflow-y: auto; scrollbar-width: thin; scrollbar-color: #333 transparent;
+    padding: 14px; border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 10px;
+    background: rgba(12, 12, 12, 0.42); backdrop-filter: blur(3px);
+    transition: background 0.2s;
+    color: #bbb; font: 12px/1.2 system-ui, sans-serif; user-select: none;
+  }
+  #panel:hover { background: rgba(12, 12, 12, 0.62); }   /* un po' più leggibile mentre lo usi */
+  #panel.hidden { display: none; }
+  /* Chiusura con un clic (×) e pulsante per riaprire */
+  #close, #open {
+    border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 6px;
+    background: rgba(12, 12, 12, 0.42); color: #bbb; cursor: pointer;
+    font: 14px/1 system-ui, sans-serif; transition: background 0.15s, color 0.15s;
+  }
+  #close:hover, #open:hover { background: rgba(40, 40, 40, 0.8); color: #fff; }
+  #close { position: absolute; top: 8px; right: 8px; width: 22px; height: 22px; padding: 0; }
+  #open {
+    position: fixed; top: 12px; left: 12px; z-index: 1; display: none;
+    padding: 7px 10px; font-size: 12px; letter-spacing: 0.05em; backdrop-filter: blur(3px);
+  }
+  #panel.hidden + #open { display: block; }
+  .group + .group { margin-top: 14px; padding-top: 12px; border-top: 1px solid #222; }
+  .group h2 {
+    margin: 0 0 10px; color: #666; font-size: 10px; font-weight: 600;
+    letter-spacing: 0.14em; text-transform: uppercase;
+  }
+  .row { display: grid; grid-template-columns: 1fr auto; gap: 6px 8px; margin-bottom: 10px; }
+  .row output { color: #eee; font-variant-numeric: tabular-nums; }
+  .row input { grid-column: 1 / -1; }
+  input[type=range] {
+    -webkit-appearance: none; appearance: none; width: 100%; height: 2px; margin: 0;
+    background: rgba(255, 255, 255, 0.2); border-radius: 1px; outline: none; cursor: pointer;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 12px; height: 12px; border-radius: 50%;
+    background: #eee; border: 0; transition: transform 0.15s;
+  }
+  input[type=range]::-moz-range-thumb {
+    width: 12px; height: 12px; border-radius: 50%; background: #eee; border: 0;
+  }
+  input[type=range]:hover::-webkit-slider-thumb { transform: scale(1.25); }
+  .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 4px; }
+  .actions button {
+    padding: 8px; border: 1px solid #333; border-radius: 6px;
+    background: transparent; color: #eee; font: inherit; letter-spacing: 0.05em; cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  .actions button:hover { background: #1c1c1c; border-color: #555; }
+  #rec::before {
+    content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 6px;
+    border-radius: 50%; background: #e5484d; vertical-align: 1px;
+  }
+  #rec.on { border-color: #e5484d; color: #e5484d; font-variant-numeric: tabular-nums; }
+  #rec.on::before { border-radius: 1px; animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0.2; } }
+  /* Sorgenti audio accese */
+  .actions button.src.on { border-color: #eee; background: #eee; color: #111; }
+  .group .actions { margin: 0 0 10px; }
+  .actions button.src {
+    overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  }
+  /* Indicatore del livello del suono */
+  .meter { height: 2px; margin: 0 0 12px; background: #222; border-radius: 1px; overflow: hidden; }
+  .meter div { height: 100%; width: 0; background: #eee; transition: width 0.05s linear; }
+  /* Riga effetto: nome, valore e interruttore on/off, slider sotto */
+  .row.fx { grid-template-columns: 1fr auto auto; }
+  .row.fx.off label, .row.fx.off output { color: #555; }
+  .row.fx.off input { opacity: 0.35; }
+  .switch {
+    position: relative; width: 24px; height: 13px; padding: 0; border: 1px solid #444;
+    border-radius: 7px; background: transparent; cursor: pointer; transition: background 0.15s;
+  }
+  .switch::after {
+    content: ""; position: absolute; top: 2px; left: 2px; width: 7px; height: 7px;
+    border-radius: 50%; background: #666; transition: transform 0.15s, background 0.15s;
+  }
+  .switch[aria-pressed=true] { background: #eee; border-color: #eee; }
+  .switch[aria-pressed=true]::after { transform: translateX(11px); background: #111; }
+  /* Fasce dell'effetto Onda: pulsanti selezionabili insieme */
+  .bands { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; margin-top: 2px; }
+  .bands button {
+    padding: 4px 0; border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 5px;
+    background: rgba(0, 0, 0, 0.35); color: #aaa; font: 11px/1.2 system-ui, sans-serif; cursor: pointer;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+  }
+  .bands button:hover { border-color: rgba(255, 255, 255, 0.3); color: #ccc; }
+  .bands button[aria-pressed=true] { background: #eee; border-color: #eee; color: #111; }
+  .row.fx.off .bands { opacity: 0.35; }
+  .bands.styles, .bands.palettes, .bands.quality { margin-top: 0; }
+  .row.auto { grid-template-columns: 1fr auto auto; margin: 10px 0 0; }
+  .group .sub { margin: 8px 0 5px; color: #555; font-size: 10px; }
+  .group h2 + .sub { margin-top: 0; }
+  /* Opzioni del singolo stile/palette: visibili solo quando servono */
+  .opts { display: none; margin: 10px 0 0; }
+  .opts.show { display: grid; }
+  .opts input[type=text] {
+    grid-column: 1 / -1; padding: 5px 7px; border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 5px;
+    background: rgba(0, 0, 0, 0.35); color: #eee; font: 12px/1.2 system-ui, sans-serif; outline: none;
+  }
+  .opts input[type=text]:focus { border-color: rgba(255, 255, 255, 0.4); }
+  .opts .colors { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .opts input[type=color] {
+    width: 100%; height: 22px; padding: 0; border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 5px; background: transparent; cursor: pointer;
+  }
+  /* Pagina generata senza foto: invito a sceglierne una */
+  /* Statistiche in alto a destra, stessa grafica del pannello dei controlli */
+  #stats {
+    position: fixed; top: 12px; right: 12px; z-index: 1; width: 200px;
+    padding: 14px; border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 10px;
+    background: rgba(12, 12, 12, 0.42); backdrop-filter: blur(3px); transition: background 0.2s;
+    color: #bbb; font: 12px/1.2 system-ui, sans-serif; user-select: none;
+  }
+  #stats:hover { background: rgba(12, 12, 12, 0.62); }
+  #stats.hidden { display: none; }
+  #stats h2 {
+    margin: 0 0 10px; color: #666; font-size: 10px; font-weight: 600;
+    letter-spacing: 0.14em; text-transform: uppercase;
+  }
+  #stats .fps { margin-bottom: 10px; color: #eee; font-size: 26px; font-weight: 300; font-variant-numeric: tabular-nums; }
+  #stats .fps small { margin-left: 4px; color: #666; font-size: 10px; letter-spacing: 0.1em; }
+  #stats .spark { display: block; width: 100%; height: 22px; margin-bottom: 10px; }
+  #stats dl { display: grid; grid-template-columns: 1fr auto; gap: 5px 8px; margin: 0; }
+  #stats dt { color: #888; }
+  #stats dd { margin: 0; color: #eee; text-align: right; font-variant-numeric: tabular-nums; }
+  #stats .sub { padding-left: 10px; color: #999; font-size: 11px; }
+  #stats dd.sub { color: #bbb; }
+  #stats dd.warn { color: #e5a84d; }
+  #stats dd.bad { color: #e5484d; }
+  #statsClose {
+    position: absolute; top: 8px; right: 8px; width: 22px; height: 22px; padding: 0;
+    border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 6px; background: rgba(12, 12, 12, 0.42);
+    color: #bbb; font: 14px/1 system-ui, sans-serif; cursor: pointer; transition: background 0.15s, color 0.15s;
+  }
+  #statsClose:hover { background: rgba(40, 40, 40, 0.8); color: #fff; }
+  #empty { position: fixed; inset: 0; display: none; place-items: center; pointer-events: none; }
+  #empty.show { display: grid; }
+  #empty .box {
+    pointer-events: auto; padding: 22px 26px; border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 12px; background: rgba(12, 12, 12, 0.7); backdrop-filter: blur(4px);
+    color: #bbb; font: 13px/1.3 system-ui, sans-serif; text-align: center;
+  }
+  #empty p { margin: 0 0 12px; color: #888; letter-spacing: 0.05em; }
+  #empty button {
+    padding: 9px 16px; border: 1px solid #eee; border-radius: 6px; background: #eee;
+    color: #111; font: inherit; cursor: pointer;
+  }
+  #empty button:hover { background: #fff; }
+  #panel small { display: block; margin-top: 10px; color: #555; font-size: 10px; text-align: center; }
+</style></head>
+<body><canvas id="c" title="Muovi il cursore per agitare i segni, clic per un'onda, spazio per la pausa"></canvas>
+<div id="panel">
+  <button id="close" title="Chiudi il pannello (H)" aria-label="Chiudi il pannello">×</button>
+  <section class="group">
+    <h2>Immagine</h2>
+    <div class="actions" style="grid-template-columns: 1fr">
+      <button id="image" class="src">Carica immagine</button>
+    </div>
+    <input id="imageFile" type="file" accept="image/*" hidden>
+  </section>
+  <section class="group">
+    <h2>Stile</h2>
+    <div class="sub">Caratteri</div>
+    <div class="bands styles">
+      <button data-style="ascii">ASCII</button>
+      <button data-style="braille">Braille</button>
+      <button data-style="testo">Testo</button>
+      <button data-style="contorni">Contorni</button>
+      <button data-style="matrix">Matrix</button>
+    </div>
+    <div class="sub">Forme</div>
+    <div class="bands styles">
+      <button data-style="retino">Retino</button>
+      <button data-style="dithering">Dithering</button>
+      <button data-style="pixel">Pixel</button>
+      <button data-style="tratteggio">Tratteggio</button>
+      <button data-style="puntini">Puntini</button>
+      <button data-style="linee">Linee</button>
+    </div>
+    <!-- Opzioni che compaiono solo con lo stile corrispondente -->
+    <div class="row opts" data-for="testo">
+      <label for="phrase">Frase</label><span></span>
+      <input id="phrase" type="text" value="ASCII ART" maxlength="200" spellcheck="false">
+    </div>
+    <div class="row opts" data-for="contorni">
+      <label for="edge">Soglia contorni</label><output id="edgeVal"></output>
+      <input id="edge" type="range" min="0.02" max="0.6" step="0.01">
+    </div>
+    <div class="row opts" data-for="pixel">
+      <label for="levels">Livelli colore</label><output id="levelsVal"></output>
+      <input id="levels" type="range" min="2" max="8" step="1">
+    </div>
+  </section>
+  <section class="group" id="paletteGroup">
+    <h2>Palette</h2>
+    <div class="bands palettes">
+      <button data-pal="originale">Originale</button>
+      <button data-pal="fosforo">Fosforo</button>
+      <button data-pal="ambra">Ambra</button>
+      <button data-pal="duotone">Duotone</button>
+      <button data-pal="gameboy">Game Boy</button>
+    </div>
+    <div class="row opts duo" data-pal-for="duotone">
+      <label>Scuro / chiaro</label><span></span>
+      <div class="colors"><input id="duoA" type="color" value="#1b0b3a"><input id="duoB" type="color" value="#ff5ac8"></div>
+    </div>
+  </section>
+  <section class="group">
+    <h2>Effetti finali</h2>
+    <div class="row fx" data-fx="crt">
+      <label for="crt">CRT</label><output id="crtVal"></output>
+      <button class="switch" aria-label="CRT on/off"></button>
+      <input id="crt" type="range" min="0" max="2" step="0.05">
+    </div>
+    <div class="row fx" data-fx="glitch">
+      <label for="glitch">Glitch</label><output id="glitchVal"></output>
+      <button class="switch" aria-label="Glitch on/off"></button>
+      <input id="glitch" type="range" min="0" max="3" step="0.05">
+    </div>
+    <div class="row fx" data-fx="bloom">
+      <label for="bloom">Bloom</label><output id="bloomVal"></output>
+      <button class="switch" aria-label="Bloom on/off"></button>
+      <input id="bloom" type="range" min="0" max="3" step="0.05">
+    </div>
+  </section>
+  <section class="group">
+    <h2>Puntatore</h2>
+    <div class="row">
+      <label for="radius">Raggio</label><output id="radiusVal"></output>
+      <input id="radius" type="range" min="1" max="30" step="1">
+    </div>
+    <div class="row">
+      <label for="push">Spinta</label><output id="pushVal"></output>
+      <input id="push" type="range" min="0" max="10" step="0.1">
+    </div>
+  </section>
+  <section class="group">
+    <h2>Sfondo</h2>
+    <div class="row">
+      <label for="speed">Velocità</label><output id="speedVal"></output>
+      <input id="speed" type="range" min="0" max="5" step="0.1">
+    </div>
+    <div class="row">
+      <label for="vary">Variazione segni</label><output id="varyVal"></output>
+      <input id="vary" type="range" min="0" max="4" step="0.1">
+    </div>
+    <div class="row">
+      <label for="size">Grandezza segni</label><output id="sizeVal"></output>
+      <input id="size" type="range" min="0.2" max="3" step="0.05">
+    </div>
+    <div class="row">
+      <label for="cols">Quantità segni</label><output id="colsVal"></output>
+      <input id="cols" type="range" min="20" max="300" step="1">
+    </div>
+  </section>
+  <section class="group">
+    <h2>Prestazioni</h2>
+    <div class="sub">Qualità (densità dei pixel)</div>
+    <div class="bands quality">
+      <button data-q="bassa">Bassa</button>
+      <button data-q="media">Media</button>
+      <button data-q="piena">Piena</button>
+    </div>
+    <div class="row auto">
+      <label for="autoQ">Automatica</label><span></span>
+      <button id="autoQ" class="switch" aria-label="Qualità automatica on/off"></button>
+    </div>
+  </section>
+  <section class="group">
+    <h2>Suono</h2>
+    <div class="actions">
+      <button id="mic" class="src">Microfono</button>
+      <button id="audio" class="src">Audio</button>
+    </div>
+    <input id="audioFile" type="file" accept="audio/*" hidden>
+    <div class="meter"><div id="meterFill"></div></div>
+    <div class="row">
+      <label for="sens">Sensibilità</label><output id="sensVal"></output>
+      <input id="sens" type="range" min="0.2" max="5" step="0.1">
+    </div>
+    <div class="row fx" data-fx="spec">
+      <label for="spec">Spettro</label><output id="specVal"></output>
+      <button class="switch" aria-label="Spettro on/off"></button>
+      <input id="spec" type="range" min="0" max="4" step="0.1">
+    </div>
+    <div class="row fx" data-fx="wave">
+      <label for="wave">Onda</label><output id="waveVal"></output>
+      <button class="switch" aria-label="Onda on/off"></button>
+      <input id="wave" type="range" min="0" max="4" step="0.1">
+      <div class="bands">
+        <button data-band="bassi">Bassi</button>
+        <button data-band="medi">Medi</button>
+        <button data-band="alti">Alti</button>
+      </div>
+    </div>
+    <div class="row fx" data-fx="bass">
+      <label for="bass">Bassi</label><output id="bassVal"></output>
+      <button class="switch" aria-label="Bassi on/off"></button>
+      <input id="bass" type="range" min="0" max="4" step="0.1">
+    </div>
+    <div class="row fx" data-fx="chaos">
+      <label for="chaos">Caos dal volume</label><output id="chaosVal"></output>
+      <button class="switch" aria-label="Caos on/off"></button>
+      <input id="chaos" type="range" min="0" max="4" step="0.1">
+    </div>
+  </section>
+  <div class="actions">
+    <button id="save">Salva PNG</button>
+    <button id="rec">Registra</button>
+  </div>
+  <small>1–9 / ← → stile · I immagine · S salva · R registra · M microfono · H nasconde · F statistiche · spazio pausa</small>
+</div>
+<button id="open" title="Apri il pannello (H)">☰ Controlli</button>
+<div id="stats">
+  <button id="statsClose" title="Nascondi le statistiche (F)" aria-label="Nascondi le statistiche">×</button>
+  <h2>Statistiche</h2>
+  <div class="fps"><span id="stFps">0</span><small>FPS</small></div>
+  <canvas id="stSpark" class="spark" title="FPS negli ultimi secondi"></canvas>
+  <dl>
+    <dt>FPS min / medio</dt><dd id="stFpsRange">–</dd>
+    <dt>Disegno</dt><dd id="stMs">–</dd>
+    <dt class="sub">animazione</dt><dd id="stAnim" class="sub">–</dd>
+    <dt class="sub">segni</dt><dd id="stCellsMs" class="sub">–</dd>
+    <dt class="sub">effetti</dt><dd id="stPost" class="sub">–</dd>
+    <dt>Risoluzione</dt><dd id="stRes">–</dd>
+    <dt>Qualità</dt><dd id="stQ">–</dd>
+    <dt>Griglia</dt><dd id="stGrid">–</dd>
+    <dt>Celle</dt><dd id="stCells">–</dd>
+    <dt>Stile</dt><dd id="stStyle">–</dd>
+    <dt>Palette</dt><dd id="stPal">–</dd>
+    <dt>Celle agitate</dt><dd id="stAgit">–</dd>
+    <dt>Onde attive</dt><dd id="stShocks">–</dd>
+    <dt>Suono</dt><dd id="stSound">–</dd>
+    <dt>Stato</dt><dd id="stState">–</dd>
+  </dl>
+</div>
+<div id="empty">
+  <div class="box">
+    <p>Nessuna immagine</p>
+    <button id="emptyPick">Carica un'immagine</button>
+  </div>
+</div>
+<script>
+const D = __DATA__;
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+const n = D.chars.length - 1;
+const J = Math.max(1, n * 0.08);   // ampiezza della variazione dei caratteri
+let CELL = 2;                      // altezza delle celle rispetto alla larghezza (vedi fit)
+
+// Dati per cella, ricalcolati quando si carica un'altra immagine.
+// "disturb" è quanto ogni cella è agitata (0..1) dal cursore, dai clic e dai bassi.
+let total, base, jitter, fills, palRGB, disturb, edgeMag, edgeChar, dotOff;
+
+// Palette (solo modalità colore): ricolora ogni cella partendo da colore e luminosità.
+// Ogni palette restituisce [r, g, b]; "bg" è il colore di sfondo che le si abbina.
+let palette = "originale";
+const duo = { a: [0x1b, 0x0b, 0x3a], b: [0xff, 0x5a, 0xc8] };
+const GB = [[0x0f, 0x38, 0x0f], [0x30, 0x62, 0x30], [0x8b, 0xac, 0x0f], [0x9b, 0xbc, 0x0f]];
+const PALETTES = {
+  originale: { map: (r, g, b) => [r, g, b],                                  bg: () => D.bg },
+  fosforo:   { map: (r, g, b, t) => [t * 50, 40 + t * 215, t * 90],          bg: () => "#020a04" },
+  ambra:     { map: (r, g, b, t) => [40 + t * 215, 20 + t * 156, t * 30],    bg: () => "#0a0500" },
+  duotone:   { map: (r, g, b, t) => duo.a.map((a, k) => a + (duo.b[k] - a) * t),
+               bg: () => `rgb(${duo.a.join(",")})` },
+  gameboy:   { map: (r, g, b, t) => GB[Math.min(3, Math.floor(t * 4))],      bg: () => "#0f380f" },
+};
+function pageBg() { return D.color ? PALETTES[palette].bg() : D.bg; }
+function applyPalette() {
+  fills = [];
+  palRGB = new Uint8ClampedArray(total * 3);
+  if (!D.color) return;
+  const map = PALETTES[palette].map;
+  for (let i = 0; i < total; i++) {
+    const c = map(D.rgb[i*3], D.rgb[i*3+1], D.rgb[i*3+2], D.lum[i] / 255);
+    palRGB[i*3] = c[0]; palRGB[i*3+1] = c[1]; palRGB[i*3+2] = c[2];
+    fills.push(`rgb(${palRGB[i*3]},${palRGB[i*3+1]},${palRGB[i*3+2]})`);
+  }
+}
+
+// Contorni: filtro di Sobel sulla luminosità. Per ogni cella la forza del bordo
+// e il carattere che ne segue la direzione (- \\ | /).
+function findEdges() {
+  edgeMag = new Float32Array(total);
+  edgeChar = new Array(total).fill("");
+  const L = (x, y) => D.lum[Math.min(D.h - 1, Math.max(0, y)) * D.w + Math.min(D.w - 1, Math.max(0, x))];
+  for (let y = 0, i = 0; y < D.h; y++) for (let x = 0; x < D.w; x++, i++) {
+    const gx = L(x+1, y-1) + 2 * L(x+1, y) + L(x+1, y+1) - L(x-1, y-1) - 2 * L(x-1, y) - L(x-1, y+1);
+    const gy = (L(x-1, y+1) + 2 * L(x, y+1) + L(x+1, y+1) - L(x-1, y-1) - 2 * L(x, y-1) - L(x+1, y-1)) / CELL;
+    edgeMag[i] = Math.hypot(gx, gy) / 1020;
+    const a = (Math.atan2(gy, gx) * 180 / Math.PI + 270) % 180;   // direzione del bordo, 0..180
+    edgeChar[i] = a < 22.5 || a >= 157.5 ? "-" : a < 67.5 ? "\\\\" : a < 112.5 ? "|" : "/";
+  }
+}
+
+function setPixels() {
+  total = D.w * D.h;
+  base = Float32Array.from(D.lum, l => l * n / 255);
+  jitter = new Float32Array(total);
+  disturb = new Float32Array(total);
+  dotOff = Float32Array.from({ length: total * 8 }, () => Math.random() * 0.8 - 0.4);   // puntinismo
+  applyPalette();
+  findEdges();
+}
+setPixels();
+
+// Le celle sono alte CELL volte la larghezza: 2 per gli stili a caratteri e per
+// Linee (una linea ogni due larghezze), 1 per Retino, Dithering, Pixel, Tratteggio
+// e Puntini, che usano celle quadrate (vedi "aspect" in STYLES). L'immagine viene
+// campionata con la stessa proporzione, così mantiene le proporzioni originali.
+// (CELL è dichiarata in cima, perché serve già al calcolo dei contorni.)
+let cw, ch, baseFont;
+let SIZE = 1;              // grandezza dei segni rispetto alla cella (1 = la riempiono)
+function applyFont() {
+  ctx.font = `${baseFont * SIZE}px monospace`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+}
+// boxW × boxH è l'area del canvas (px CSS); ox, oy spostano la griglia per centrarla.
+// Durante una registrazione il canvas NON cambia dimensione (gli encoder video non lo
+// sopportano): se cambiano griglia, stile o finestra, la griglia si adatta dentro il
+// riquadro già esistente.
+let boxW = 0, boxH = 0, ox = 0, oy = 0;
+
+// Qualità = densità di pixel del canvas. "Piena" usa quella dello schermo (sui
+// telefoni anche 2,5–3×, cioè 6–9 volte i pixel); "media" la limita a 1,5×, "bassa" a 1×.
+// In automatico la pagina scende di livello se il disegno è troppo lento e risale
+// quando torna fluida, senza mai superare il livello scelto.
+const Q_LEVELS = ["bassa", "media", "piena"];
+const Q_CAP = { bassa: 1, media: 1.5, piena: Infinity };
+let quality = "piena", autoQ = true, autoLevel = null;
+function currentQuality() {
+  return autoQ && autoLevel && Q_LEVELS.indexOf(autoLevel) < Q_LEVELS.indexOf(quality) ? autoLevel : quality;
+}
+const qualityDpr = q => Math.min(window.devicePixelRatio || 1, Q_CAP[q]);
+
+function fit() {
+  const locked = !!recorder;
+  // Durante la registrazione si tiene la densità con cui il canvas è stato creato
+  // (anche se cambia lo zoom del browser o il monitor)
+  const dpr = locked ? cv.width / boxW : qualityDpr(currentQuality());
+  const availW = locked ? boxW : Math.max(16, innerWidth - 16);
+  const availH = locked ? boxH : Math.max(16, innerHeight - 16);
+  cw = Math.min(availW / D.w, availH / (D.h * CELL));
+  ch = cw * CELL;
+  if (!locked) {
+    boxW = cw * D.w;
+    boxH = ch * D.h;
+    cv.style.width = boxW + "px";
+    cv.style.height = boxH + "px";
+    cv.width = Math.round(boxW * dpr);
+    cv.height = Math.round(boxH * dpr);
+  }
+  ox = (boxW - cw * D.w) / 2;
+  oy = (boxH - ch * D.h) / 2;
+  ctx.setTransform(dpr, 0, 0, dpr, ox * dpr, oy * dpr);
+  ctx.font = "100px monospace";
+  const ratio = ctx.measureText("M").width / 100;
+  baseFont = Math.min(ch, cw / ratio);
+  applyFont();
+}
+
+// Interazione col cursore: alza "disturb" nel suo raggio, che poi si spegne
+// piano lasciando una scia.
+let RADIUS = 7;            // raggio d'azione in celle (larghezza), regolabile dal pannello
+let PUSH = 2.0;            // quanto i segni vengono spinti via (in celle), regolabile dal pannello
+let SPEED = 1;             // velocità dell'onda che attraversa lo sfondo (0 = ferma)
+let VARY = 1;              // quanto spesso e quanto forte cambiano i segni (0 = immagine fissa)
+let phase = 0, lastT = 0;  // fase dell'onda, accumulata per cambiare velocità senza salti
+let mouse = null;          // posizione del cursore in celle, o null se fuori
+const shocks = [];         // onde d'urto create dai clic
+
+let agitated = 0;          // celle agitate nell'ultimo fotogramma (per statistiche e risparmio)
+function stir(t) {
+  agitated = 0;
+  for (let i = 0; i < total; i++) if ((disturb[i] *= 0.92) > 0.02) agitated++;
+  if (mouse) touchArea(mouse.x, mouse.y, RADIUS, 1);
+  for (let s = shocks.length - 1; s >= 0; s--) {
+    const sh = shocks[s], r = (t - sh.t) * 0.04;
+    if (r > Math.max(D.w, D.h * CELL)) { shocks.splice(s, 1); continue; }
+    ring(sh.x, sh.y, r);
+  }
+}
+
+function touchArea(cx, cy, R, power) {
+  const y0 = Math.max(0, Math.floor(cy - R / CELL)), y1 = Math.min(D.h - 1, Math.ceil(cy + R / CELL));
+  const x0 = Math.max(0, Math.floor(cx - R)), x1 = Math.min(D.w - 1, Math.ceil(cx + R));
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const d = Math.hypot(x + 0.5 - cx, (y + 0.5 - cy) * CELL) / R;
+    if (d < 1) { const i = y * D.w + x; disturb[i] = Math.max(disturb[i], (1 - d) * power); }
+  }
+}
+
+// Anello di un'onda d'urto: si visitano solo le celle del quadrato che lo contiene
+function ring(cx, cy, r) {
+  const R = r + 2;
+  const y0 = Math.max(0, Math.floor(cy - R / CELL)), y1 = Math.min(D.h - 1, Math.ceil(cy + R / CELL));
+  const x0 = Math.max(0, Math.floor(cx - R)), x1 = Math.min(D.w - 1, Math.ceil(cx + R));
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const d = Math.abs(Math.hypot(x + 0.5 - cx, (y + 0.5 - cy) * CELL) - r);
+    if (d < 2) { const i = y * D.w + x; disturb[i] = Math.max(disturb[i], (1 - d / 2) * 0.8); }
+  }
+}
+// Al massimo MAX_SHOCKS onde insieme: le più vecchie lasciano il posto alle nuove
+const MAX_SHOCKS = 8;
+function addShock(x, y, t) {
+  shocks.push({ x, y, t });
+  if (shocks.length > MAX_SHOCKS) shocks.shift();
+}
+
+// ---- Suono ----
+// Microfono e file audio entrano in un unico ingresso ("input") e da lì in un
+// analizzatore, che ogni fotogramma fornisce lo spettro (frequenze) e la forma
+// d'onda del suono. In parallelo tre filtri separano bassi, medi e alti, così
+// l'effetto Onda può seguire solo le fasce scelte.
+let audioCtx = null, input, analyser, recDest, freq, timeData, colBin;
+const bandAn = {}, bandData = {};
+const BANDS = {                                  // fasce dell'effetto Onda
+  bassi: { on: true, boost: 1 },                 // sotto 250 Hz
+  medi:  { on: true, boost: 1.5 },               // 250 Hz – 4 kHz
+  alti:  { on: true, boost: 3 },                 // sopra 4 kHz (più deboli, quindi amplificati)
+};
+let micStream = null, micNode = null, fileNode = null;
+const audioEl = new Audio();
+audioEl.loop = true;
+let SENS = 1;                                    // sensibilità generale al suono
+const fx = {                                     // effetti: acceso/spento e intensità
+  spec:  { on: true,  v: 1 },                    // ogni colonna trema con la sua frequenza
+  wave:  { on: true,  v: 1 },                    // la forma d'onda deforma l'immagine
+  bass:  { on: true,  v: 1 },                    // sobbalzo e onda d'urto a ogni colpo di basso
+  chaos: { on: false, v: 1 },                    // il volume aumenta la variazione dei segni
+  // Effetti finali, applicati sopra qualunque stile
+  crt:    { on: false, v: 1 },                   // righe di scansione e vignettatura da monitor
+  glitch: { on: false, v: 1 },                   // strisce spostate e colori sfasati (più forte sui bassi)
+  bloom:  { on: false, v: 1 },                   // alone luminoso attorno ai segni
+};
+const snd = { active: false, rms: 0, bass: 0, bassAvg: 0, kick: 0, lastBeat: 0 };
+let colDy = new Float32Array(D.w);               // spostamento verticale di ogni colonna
+
+function ensureAudio() {
+  if (audioCtx) return;
+  audioCtx = new AudioContext();
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 2048;
+  analyser.smoothingTimeConstant = 0.6;
+  recDest = audioCtx.createMediaStreamDestination();   // per mettere l'audio nel video
+  input = audioCtx.createGain();
+  input.connect(analyser);
+  analyser.connect(recDest);
+  freq = new Uint8Array(analyser.frequencyBinCount);
+  timeData = new Float32Array(analyser.fftSize);
+  const filter = (type, f) => {
+    const b = audioCtx.createBiquadFilter();
+    b.type = type;
+    b.frequency.value = f;
+    return b;
+  };
+  const chains = {
+    bassi: [filter("lowpass", 250)],
+    medi:  [filter("highpass", 250), filter("lowpass", 4000)],
+    alti:  [filter("highpass", 4000)],
+  };
+  for (const [band, chain] of Object.entries(chains)) {
+    const an = audioCtx.createAnalyser();
+    an.fftSize = 2048;
+    chain.reduce((prev, node) => { prev.connect(node); return node; }, input).connect(an);
+    bandAn[band] = an;
+    bandData[band] = new Float32Array(an.fftSize);
+  }
+  mapColumns();
+}
+
+// Colonne → frequenze su scala logaritmica: bassi a sinistra (40 Hz), acuti a destra (12 kHz)
+function mapColumns() {
+  const nyq = audioCtx.sampleRate / 2;
+  colBin = Array.from({ length: D.w }, (_, x) => {
+    const f = 40 * Math.pow(12000 / 40, x / Math.max(1, D.w - 1));
+    return Math.min(freq.length - 1, Math.round(f / nyq * freq.length));
+  });
+}
+
+const micBtn = document.getElementById("mic");
+let micPending = false;   // richiesta del permesso in corso: altri clic vengono ignorati
+function stopMic() {
+  if (!micStream) return;
+  micStream.getTracks().forEach(tr => tr.stop());
+  micNode.disconnect();
+  micStream = micNode = null;
+  micBtn.classList.remove("on");
+}
+async function toggleMic() {
+  if (micPending) return;
+  if (micStream) { stopMic(); return; }
+  micPending = true;
+  let stream;
+  try {
+    ensureAudio();
+    await audioCtx.resume();
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    });
+  } catch (err) {
+    alert("Microfono non disponibile: " + err.message +
+          "\\n\\nSe hai aperto il file con doppio clic, prova ad aprirlo da un server locale:" +
+          "\\npython -m http.server 8000  →  http://localhost:8000/");
+    return;
+  } finally {
+    micPending = false;
+  }
+  micStream = stream;
+  micNode = audioCtx.createMediaStreamSource(micStream);
+  micNode.connect(input);   // non va agli altoparlanti: niente fischio di ritorno
+  micBtn.classList.add("on");
+  // Microfono scollegato o permesso revocato: il pulsante torna spento
+  micStream.getAudioTracks().forEach(tr => { tr.onended = stopMic; });
+}
+micBtn.addEventListener("click", toggleMic);
+
+const audioBtn = document.getElementById("audio"), fileInput = document.getElementById("audioFile");
+audioBtn.addEventListener("click", () => {
+  if (!audioEl.paused) {                // in riproduzione: ferma
+    audioEl.pause();
+    audioBtn.classList.remove("on");
+    audioBtn.textContent = "Audio";
+  } else {
+    fileInput.value = "";
+    fileInput.click();
+  }
+});
+fileInput.addEventListener("change", async () => {
+  const file = fileInput.files[0];
+  if (!file) return;
+  ensureAudio();
+  await audioCtx.resume();
+  if (!fileNode) {
+    fileNode = audioCtx.createMediaElementSource(audioEl);
+    fileNode.connect(input);
+    fileNode.connect(audioCtx.destination);   // il file si sente dagli altoparlanti
+  }
+  if (audioEl.src) URL.revokeObjectURL(audioEl.src);
+  audioEl.src = URL.createObjectURL(file);
+  try {
+    await audioEl.play();
+  } catch (err) {
+    alert("Impossibile riprodurre questo file audio. Prova con un MP3, WAV, OGG o M4A.");
+    return;
+  }
+  audioBtn.classList.add("on");
+  audioBtn.textContent = "■ " + file.name;
+  audioBtn.title = file.name;
+});
+
+// Legge l'analizzatore e aggiorna livelli, colpi di basso e spostamenti delle colonne
+const meterFill = document.getElementById("meterFill");
+function listen(t) {
+  snd.active = !!audioCtx && (!!micStream || !audioEl.paused);
+  if (!snd.active) {
+    snd.rms *= 0.8; snd.bass *= 0.8; snd.kick *= 0.8;
+    colDy.fill(0);
+    meterFill.style.width = "0";
+    return;
+  }
+  analyser.getByteFrequencyData(freq);
+  analyser.getFloatTimeDomainData(timeData);
+  if (fx.wave.on) for (const band in BANDS)
+    if (BANDS[band].on) bandAn[band].getFloatTimeDomainData(bandData[band]);
+
+  let sum = 0;
+  for (let i = 0; i < timeData.length; i++) sum += timeData[i] * timeData[i];
+  snd.rms = Math.min(1, Math.sqrt(sum / timeData.length) * 4 * SENS);
+  meterFill.style.width = snd.rms * 100 + "%";
+
+  // Energia dei bassi (fino a ~150 Hz) e rilevamento dei colpi
+  const bassTop = Math.max(2, Math.round(150 / (audioCtx.sampleRate / 2) * freq.length));
+  let b = 0;
+  for (let i = 1; i < bassTop; i++) b += freq[i];
+  snd.bass = Math.min(1.5, b / (bassTop - 1) / 255 * SENS);
+  const beat = snd.bass > 0.3 && snd.bass > snd.bassAvg * 1.25 + 0.05 && t - snd.lastBeat > 180;
+  snd.bassAvg = snd.bassAvg * 0.9 + snd.bass * 0.1;
+  snd.kick *= 0.8;
+  if (beat && fx.bass.on && fx.bass.v > 0) {
+    snd.lastBeat = t;
+    snd.kick = 1;
+    addShock(D.w / 2, D.h / 2, t);
+  }
+
+  // Spostamento verticale di ogni colonna: tremolio dello spettro + forma d'onda
+  for (let x = 0; x < D.w; x++) {
+    let dy = 0;
+    if (fx.spec.on) {
+      const a = Math.min(1.5, Math.pow(freq[colBin[x]] / 255, 2) * SENS);
+      dy += a * fx.spec.v * 0.8 * Math.sin(t * 0.06 + x * 1.7);
+    }
+    if (fx.wave.on) {
+      const idx = Math.floor(x / D.w * timeData.length);
+      let s = 0;
+      for (const band in BANDS) if (BANDS[band].on) s += bandData[band][idx] * BANDS[band].boost;
+      dy += s * SENS * fx.wave.v * 6;
+    }
+    colDy[x] = dy * ch;
+  }
+}
+
+// ---- Stili ----
+// Il ciclo di disegno calcola per ogni cella la luminosità "v" (0 = buio, 1 = chiaro,
+// già animata e agitata da cursore e suono) e la posizione (px, py); poi chiama
+// lo stile scelto, che decide solo COME disegnarla.
+// "ink" è quanto la cella deve essere marcata: le zone chiare su sfondo nero
+// (modalità colore), le zone scure su sfondo bianco (bianco e nero); con --invert
+// è il contrario, per tutti gli stili. "inkDark" vale per gli stili che hanno
+// sempre lo sfondo nero (Matrix), qualunque sia la modalità.
+const ink = v => D.color !== D.invert ? v : 1 - v;
+const inkDark = v => D.invert ? 1 - v : v;
+const TAU = Math.PI * 2;
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];   // soglie del dithering 4×4
+const KATA = "ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ0123456789:.=*+-<>";
+const GREENS = Array.from({ length: 25 }, (_, q) =>   // sfumature di verde Matrix, dal buio al pieno
+  `rgb(${Math.round(30 * q / 24)},${Math.round(255 * q / 24)},${Math.round(80 * q / 24)})`);
+let mHead = new Float32Array(0), mSpeed, mChar = new Uint8Array(0);   // stato della pioggia Matrix
+let rowPts = [];                                                       // punti della riga (stile Linee)
+let TEXT = "ASCIIART";                                                 // frase dello stile Testo (senza spazi)
+let EDGE = 0.15;                                                       // soglia dello stile Contorni
+let LEVELS = 4;                                                        // livelli per canale dello stile Pixel
+
+// Colore di una cella che segue la sua luminosità animata "v": a colori parte dal
+// colore originale e lo schiarisce/scurisce, oppure lo ricalcola con la palette
+// (così Fosforo, Ambra e Game Boy restano nei loro colori); in bianco e nero è un
+// grigio. "levels" (opzionale) riduce i colori, effetto Pixel.
+// I colori sono arrotondati a passi di 8 e le stringhe "rgb(...)" riusate da una
+// cache: niente stringhe nuove per ogni cella a ogni fotogramma.
+const GRAYS = Array.from({ length: 33 }, (_, q) => { const g = Math.round(q * 255 / 32); return `rgb(${g},${g},${g})`; });
+const colorCache = new Map();
+function rgbStr(r, g, b) {
+  const q = c => Math.min(255, Math.max(0, Math.round(c / 8) * 8));
+  r = q(r); g = q(g); b = q(b);
+  const key = (r << 16) | (g << 8) | b;
+  let s = colorCache.get(key);
+  if (!s) { s = `rgb(${r},${g},${b})`; colorCache.set(key, s); }
+  return s;
+}
+function shade(i, v, levels) {
+  if (!D.color) {
+    let g = 1 - ink(v);                        // inchiostro scuro su sfondo bianco
+    if (levels) g = Math.round(g * (levels - 1)) / (levels - 1);
+    return GRAYS[Math.round(g * 32)];
+  }
+  let r, g, b;
+  if (palette === "originale") {
+    const dv = (v - base[i] / n) * 255;
+    r = D.rgb[i*3] + dv; g = D.rgb[i*3+1] + dv; b = D.rgb[i*3+2] + dv;
+  } else {
+    [r, g, b] = PALETTES[palette].map(D.rgb[i*3], D.rgb[i*3+1], D.rgb[i*3+2], Math.min(1, Math.max(0, v)));
+  }
+  if (levels) {
+    const s = 255 / (levels - 1), q = c => Math.round(Math.min(255, Math.max(0, c)) / s) * s;
+    r = q(r); g = q(g); b = q(b);
+  }
+  return rgbStr(r, g, b);
+}
+
+// Braille: ogni carattere ⠿ ha 2×4 puntini, quindi 8 "pixel" per cella. Le soglie
+// ordinate (come nel dithering) rendono le sfumature di grigio.
+const BR_DX = [0, 0, 0, 1, 1, 1, 0, 1], BR_DY = [0, 1, 2, 0, 1, 2, 3, 3];   // puntino k → posizione
+const BR_T = [0, 6, 1, 4, 2, 5, 7, 3].map(t => (t + 0.5) / 8);              // soglia del puntino k
+
+const STYLES = {
+  // Caratteri scelti in base alla luminosità (lo stile originale)
+  ascii: {
+    aspect: 2, bg: pageBg,
+    begin() { if (!D.color) ctx.fillStyle = D.fg; },
+    cell(i, x, y, px, py, v) {
+      const c = D.chars[Math.round(v * n)];
+      if (c === " ") return;
+      if (D.color) ctx.fillStyle = fills[i];
+      ctx.fillText(c, px, py);
+    },
+  },
+
+  // Retino tipografico: un cerchio per cella, più grande dove c'è più "inchiostro"
+  retino: {
+    aspect: 1, bg: pageBg,
+    begin() { ctx.fillStyle = D.fg; if (!D.color) ctx.beginPath(); },
+    cell(i, x, y, px, py, v) {
+      const r = Math.sqrt(ink(v)) * cw * 0.6 * SIZE;   // sqrt: l'area cresce con l'inchiostro
+      if (r < 0.3) return;
+      if (D.color) { ctx.fillStyle = fills[i]; ctx.beginPath(); ctx.arc(px, py, r, 0, TAU); ctx.fill(); }
+      else { ctx.moveTo(px + r, py); ctx.arc(px, py, r, 0, TAU); }
+    },
+    end() { if (!D.color) ctx.fill(); },
+  },
+
+  // Dithering ordinato (Bayer 4×4): ogni cella è un quadratino acceso o spento
+  dithering: {
+    aspect: 1, bg: pageBg,
+    begin() { ctx.fillStyle = D.fg; if (!D.color) ctx.beginPath(); },
+    cell(i, x, y, px, py, v) {
+      if (ink(v) <= (BAYER[(y & 3) * 4 + (x & 3)] + 0.5) / 16) return;
+      const s = cw * SIZE + 0.5;   // mezzo pixel in più: niente righe sottili tra i quadratini
+      if (D.color) { ctx.fillStyle = fills[i]; ctx.fillRect(px - s / 2, py - s / 2, s, s); }
+      else ctx.rect(px - s / 2, py - s / 2, s, s);
+    },
+    end() { if (!D.color) ctx.fill(); },
+  },
+
+  // Matrix: colonne di katakana verdi che cadono; l'immagine emerge nelle scie
+  matrix: {
+    aspect: 2, bg: () => "#000",
+    begin() {
+      if (mHead.length !== D.w || mChar.length !== total) {   // griglia cambiata: nuova pioggia
+        mHead = Float32Array.from({ length: D.w }, () => Math.random() * D.h * 2 - D.h);
+        mSpeed = Float32Array.from({ length: D.w }, () => 0.3 + Math.random() * 0.7);
+        mChar = Uint8Array.from({ length: total }, () => Math.random() * KATA.length);
+      }
+      const trail = D.h * 0.6;
+      for (let x = 0; x < D.w; x++) {
+        mHead[x] += mSpeed[x] * SPEED;
+        if (mHead[x] - trail > D.h) { mHead[x] = -Math.random() * D.h * 0.5; mSpeed[x] = 0.3 + Math.random() * 0.7; }
+      }
+    },
+    cell(i, x, y, px, py, v) {
+      const d = mHead[x] - y, trail = D.h * 0.6;
+      const head = d >= 0 && d < 1;
+      const glow = d >= 0 && d < trail ? 1 - d / trail : 0;
+      if (head || Math.random() < 0.04 * VARY) mChar[i] = Math.random() * KATA.length;
+      // La foto si intravede sempre un po'; nelle scie diventa piena
+      const level = inkDark(v) * (0.35 + 0.65 * glow);
+      if (!head && level < 0.04) return;
+      ctx.fillStyle = head ? "#d8ffe0" : GREENS[Math.min(24, Math.round(level * 24))];
+      ctx.fillText(KATA[mChar[i]], px, py);
+    },
+  },
+
+  // Linee ondulate: una linea per riga che si solleva dove c'è più inchiostro.
+  // Ogni linea copre quelle dietro (dall'alto in basso), come "Unknown Pleasures".
+  linee: {
+    aspect: 2, bg: pageBg,
+    begin() {
+      ctx.lineWidth = Math.max(1, cw * 0.18 * SIZE);
+      ctx.lineJoin = ctx.lineCap = "round";
+    },
+    cell(i, x, y, px, py, v) {
+      rowPts.push(px, py + ch * 0.45 - ink(v) * ch * 1.8 * SIZE, i);
+    },
+    row(y) {
+      const p = rowPts;
+      if (p.length < 6) { rowPts = []; return; }
+      ctx.beginPath();                                   // copre le linee dietro
+      ctx.moveTo(p[0], p[1]);
+      for (let k = 3; k < p.length; k += 3) ctx.lineTo(p[k], p[k + 1]);
+      ctx.lineTo(p[p.length - 3], (y + 1.5) * ch);
+      ctx.lineTo(p[0], (y + 1.5) * ch);
+      ctx.closePath();
+      ctx.fillStyle = pageBg();
+      ctx.fill();
+      if (D.color) {                                     // ogni tratto col colore della foto
+        for (let k = 3; k < p.length; k += 3) {
+          ctx.beginPath();
+          ctx.moveTo(p[k - 3], p[k - 2]);
+          ctx.lineTo(p[k], p[k + 1]);
+          ctx.strokeStyle = fills[p[k + 2]];
+          ctx.stroke();
+        }
+      } else {
+        ctx.beginPath();
+        ctx.moveTo(p[0], p[1]);
+        for (let k = 3; k < p.length; k += 3) ctx.lineTo(p[k], p[k + 1]);
+        ctx.strokeStyle = D.fg;
+        ctx.stroke();
+      }
+      rowPts = [];
+    },
+  },
+
+  // Braille: 8 puntini per carattere → dettaglio molto più fine dell'ASCII
+  braille: {
+    aspect: 2, bg: pageBg, sub: true,
+    begin() { if (!D.color) ctx.fillStyle = D.fg; },
+    cell(i, x, y, px, py, v) {
+      if (!D.sub) return;
+      const dv = v - base[i] / n, W2 = D.w * 2;   // l'animazione della cella sposta tutti i puntini
+      let bits = 0;
+      for (let k = 0; k < 8; k++) {
+        const l = D.sub[(y * 4 + BR_DY[k]) * W2 + x * 2 + BR_DX[k]] / 255 + dv;
+        if (ink(l) > BR_T[k]) bits |= 1 << k;
+      }
+      if (!bits) return;
+      if (D.color) ctx.fillStyle = fills[i];
+      ctx.fillText(String.fromCharCode(0x2800 + bits), px, py);
+    },
+  },
+
+  // Testo: l'immagine è composta dalla frase ripetuta; la luminosità decide il colore
+  testo: {
+    aspect: 2, bg: pageBg,
+    begin() {},
+    cell(i, x, y, px, py, v) {
+      if (ink(v) < 0.08) return;
+      ctx.fillStyle = shade(i, v);
+      ctx.fillText(TEXT[i % TEXT.length], px, py);
+    },
+  },
+
+  // Contorni: sui bordi un carattere orientato come la linea, all'interno puntini leggeri
+  contorni: {
+    aspect: 2, bg: pageBg,
+    begin() {},
+    cell(i, x, y, px, py, v) {
+      const jump = v - base[i] / n;   // animazione e cursore spostano un po' la soglia
+      let c;
+      if (edgeMag[i] + jump * 0.3 > EDGE) c = Math.abs(jump) > 0.4 ? "/\\\\|-"[Math.random() * 4 | 0] : edgeChar[i];
+      else if (ink(v) > 0.6) c = ".";
+      else return;
+      ctx.fillStyle = D.color ? shade(i, Math.max(v, 0.85)) : D.fg;   // bordi ben visibili anche nel buio
+      ctx.fillText(c, px, py);
+    },
+  },
+
+  // Pixel art: quadrati pieni con pochi livelli di colore
+  pixel: {
+    aspect: 1, bg: pageBg,
+    begin() {},
+    cell(i, x, y, px, py, v) {
+      const s = cw * SIZE + 0.5;
+      ctx.fillStyle = shade(i, v, LEVELS);
+      ctx.fillRect(px - s / 2, py - s / 2, s, s);
+    },
+  },
+
+  // Tratteggio: da 0 a 4 strati di linee incrociate, come un'incisione a penna
+  tratteggio: {
+    aspect: 1, bg: pageBg,
+    begin() {
+      ctx.lineWidth = Math.max(0.7, cw * 0.1 * SIZE);
+      ctx.lineCap = "round";
+      if (!D.color) { ctx.strokeStyle = D.fg; ctx.beginPath(); }
+    },
+    cell(i, x, y, px, py, v) {
+      const e = ink(v), h = cw * 0.5 * SIZE;
+      if (e < 0.12) return;
+      if (D.color) { ctx.strokeStyle = shade(i, v); ctx.beginPath(); }
+      ctx.moveTo(px - h, py - h); ctx.lineTo(px + h, py + h);                    // \\
+      if (e > 0.35) { ctx.moveTo(px - h, py + h); ctx.lineTo(px + h, py - h); }   // /
+      if (e > 0.58) { ctx.moveTo(px - h, py); ctx.lineTo(px + h, py); }           // -
+      if (e > 0.8)  { ctx.moveTo(px, py - h); ctx.lineTo(px, py + h); }           // |
+      if (D.color) ctx.stroke();
+    },
+    end() { if (!D.color) ctx.stroke(); },
+  },
+
+  // Puntinismo: da 0 a 4 punti sparsi per cella, più fitti dove c'è più inchiostro
+  puntini: {
+    aspect: 1, bg: pageBg,
+    begin() { if (!D.color) { ctx.fillStyle = D.fg; ctx.beginPath(); } },
+    cell(i, x, y, px, py, v) {
+      const count = Math.floor(ink(v) * 4.99);
+      if (!count) return;
+      if (Math.random() < 0.03 * VARY)            // i punti si spostano piano: effetto brulicante
+        for (let k = 0; k < 8; k++) dotOff[i * 8 + k] = Math.random() * 0.8 - 0.4;
+      const r = cw * 0.14 * SIZE;
+      if (D.color) { ctx.fillStyle = shade(i, v); ctx.beginPath(); }
+      for (let k = 0; k < count; k++) {
+        const dx = px + dotOff[i * 8 + k * 2] * cw, dy = py + dotOff[i * 8 + k * 2 + 1] * cw;
+        ctx.moveTo(dx + r, dy);
+        ctx.arc(dx, dy, r, 0, TAU);
+      }
+      if (D.color) ctx.fill();
+    },
+    end() { if (!D.color) ctx.fill(); },
+  },
+};
+let style = "ascii";
+
+// Tempi delle fasi di un fotogramma (media mobile, in ms) per le statistiche
+const timing = { anim: 0, cells: 0, post: 0 };
+const ema = (old, x) => old * 0.85 + x * 0.15;
+
+function draw(t) {
+  const t0 = performance.now();
+  stir(t);
+  listen(t);
+  phase += Math.min(t - lastT, 100) * 0.0025 * SPEED;   // limite: niente salti dopo una pausa
+  lastT = t;
+  const vary = VARY + (fx.chaos.on ? snd.rms * fx.chaos.v * 4 : 0);
+  const changeProb = Math.min(1, 0.08 * vary), amp = J * vary;
+  // Sobbalzo sui bassi: l'immagine si allarga per un attimo dal centro
+  const kick = fx.bass.on ? 1 + snd.kick * fx.bass.v * 0.04 : 1;
+  const midX = cw * D.w / 2, midY = ch * D.h / 2;
+  const S = STYLES[style];
+  const t1 = performance.now();
+  ctx.fillStyle = S.bg();
+  ctx.fillRect(-ox, -oy, boxW, boxH);   // tutto il canvas, anche fuori dalla griglia
+  S.begin();
+  for (let y = 0, i = 0; y < D.h; y++) {
+    for (let x = 0; x < D.w; x++, i++) {
+      if (Math.random() < changeProb) jitter[i] = Math.random() * 2 - 1;
+      const wave = Math.sin(x * 0.12 + y * 0.18 - phase) * J * 0.6;
+      let v = Math.min(1, Math.max(0, (base[i] + jitter[i] * amp + wave) / n));
+      const dis = disturb[i];
+      // Celle agitate: con probabilità crescente la luminosità diventa casuale
+      if (dis > 0.02 && Math.random() < dis) v = Math.random();
+      let px = (x + 0.5) * cw, py = (y + 0.5) * ch + colDy[x];
+      if (kick !== 1) { px = midX + (px - midX) * kick; py = midY + (py - midY) * kick; }
+      if (mouse && dis > 0.02) {   // spinta radiale lontano dal cursore
+        const dx = x + 0.5 - mouse.x, dy = (y + 0.5 - mouse.y) * CELL;
+        const len = Math.hypot(dx, dy) || 1, f = dis * PUSH * cw;
+        px += dx / len * f;
+        py += dy / len * f;
+      }
+      S.cell(i, x, y, px, py, v);
+    }
+    if (S.row) S.row(y);
+  }
+  if (S.end) S.end();
+  const t2 = performance.now();
+  post();
+  const t3 = performance.now();
+  timing.anim = ema(timing.anim, t1 - t0);
+  timing.cells = ema(timing.cells, t2 - t1);
+  timing.post = ema(timing.post, t3 - t2);
+}
+
+// ---- Effetti finali ----
+// Lavorano sui pixel già disegnati del canvas, quindi valgono per ogni stile e
+// finiscono anche nei PNG e nei video.
+// Canvas di appoggio: due per il Bloom e uno per il Glitch, ridimensionati solo
+// quando la dimensione cambia davvero (ridimensionare un canvas ne rialloca la memoria).
+const bloomA = document.createElement("canvas"), bloomB = document.createElement("canvas");
+const glitchC = document.createElement("canvas");
+function sizeCanvas(c, w, h) {
+  if (c.width !== w) c.width = w;
+  if (c.height !== h) c.height = h;
+  return c.getContext("2d");
+}
+let scanPattern = null, vignette = null;
+// Sfondo scuro? Calcolato dal colore vero dello sfondo (conta per Duotone chiari)
+function darkBg() {
+  const s = STYLES[style].bg();
+  const c = s[0] === "#"
+    ? (s.length === 4 ? [...s.slice(1)].map(h => parseInt(h + h, 16)) : [1, 3, 5].map(k => parseInt(s.slice(k, k + 2), 16)))
+    : s.match(/\\d+/g).map(Number);
+  return c[0] * 0.299 + c[1] * 0.587 + c[2] * 0.114 < 128;
+}
+
+function post() {
+  const W = cv.width, H = cv.height;
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);   // pixel reali del canvas
+  if (fx.bloom.on && fx.bloom.v > 0) bloom(W, H);
+  if (fx.glitch.on && fx.glitch.v > 0) glitch(W, H);
+  if (fx.crt.on && fx.crt.v > 0) crt(W, H);
+  ctx.restore();
+}
+
+// Bloom: l'immagine rimpicciolita e riallargata è sfocata; sommata sopra crea l'alone.
+// Il secondo alone, più largo, si ricava dal primo (già piccolo) invece che dal canvas
+// intero: costa meno e i due aloni non si sommano tra loro.
+function bloom(W, H) {
+  ctx.imageSmoothingEnabled = true;
+  sizeCanvas(bloomA, Math.max(1, W / 6 | 0), Math.max(1, H / 6 | 0)).drawImage(cv, 0, 0, bloomA.width, bloomA.height);
+  sizeCanvas(bloomB, Math.max(1, W / 18 | 0), Math.max(1, H / 18 | 0)).drawImage(bloomA, 0, 0, bloomB.width, bloomB.height);
+  ctx.globalCompositeOperation = darkBg() ? "lighter" : "multiply";
+  for (const [c, a] of [[bloomA, 0.35], [bloomB, 0.25]]) {
+    ctx.globalAlpha = Math.min(1, a * fx.bloom.v);
+    ctx.drawImage(c, 0, 0, W, H);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = "source-over";
+}
+
+// Glitch: strisce orizzontali spostate a caso e una copia rossa/azzurra sfasata.
+// Più forte con i colpi di basso e col volume, se il suono è acceso.
+function glitch(W, H) {
+  const amt = fx.glitch.v * (0.4 + snd.kick * 1.5 + snd.rms);
+  if (darkBg()) {                                    // aberrazione cromatica
+    const shift = Math.round((1 + 5 * amt) * (W / boxW));   // densità reale del canvas
+    const a = sizeCanvas(glitchC, W, H);
+    a.globalCompositeOperation = "copy";     // sostituisce il fotogramma precedente
+    a.drawImage(cv, 0, 0);
+    a.globalCompositeOperation = "multiply";
+    a.fillStyle = "#f00";
+    a.fillRect(0, 0, W, H);
+    ctx.globalCompositeOperation = "lighter";
+    ctx.globalAlpha = Math.min(1, 0.45 * amt);
+    ctx.drawImage(glitchC, shift, 0);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = "source-over";
+  }
+  if (Math.random() < 0.25 * amt + snd.kick) {        // strisce spostate
+    const count = 1 + Math.floor(Math.random() * 4 * amt);
+    for (let k = 0; k < count; k++) {
+      const sy = Math.random() * H, sh = H * (0.01 + Math.random() * 0.08);
+      const dx = (Math.random() * 2 - 1) * W * 0.06 * amt;
+      ctx.drawImage(cv, 0, sy, W, sh, dx, sy, W, sh);
+    }
+  }
+}
+
+// CRT: righe di scansione, angoli più scuri e un leggero sfarfallio
+function crt(W, H) {
+  if (!scanPattern) {
+    const p = document.createElement("canvas");
+    p.width = 1; p.height = 3;
+    const pc = p.getContext("2d");
+    pc.fillStyle = "#000";
+    pc.fillRect(0, 2, 1, 1);
+    scanPattern = ctx.createPattern(p, "repeat");
+  }
+  ctx.globalAlpha = Math.min(1, 0.4 * fx.crt.v);
+  ctx.fillStyle = scanPattern;
+  ctx.fillRect(0, 0, W, H);
+  if (!vignette || vignette.w !== W || vignette.h !== H) {   // ricreata solo se cambia la misura
+    const g = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.3, W / 2, H / 2, Math.max(W, H) * 0.75);
+    g.addColorStop(0, "rgba(0,0,0,0)");
+    g.addColorStop(1, "rgba(0,0,0,0.9)");
+    vignette = { w: W, h: H, g };
+  }
+  ctx.globalAlpha = Math.min(1, 0.6 * fx.crt.v);
+  ctx.fillStyle = vignette.g;
+  ctx.fillRect(0, 0, W, H);
+  if (darkBg()) {
+    ctx.globalAlpha = Math.random() * 0.04 * fx.crt.v;
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, W, H);
+  }
+  ctx.globalAlpha = 1;
+}
+
+// Risparmio: se niente si muove (velocità e variazione a 0, niente suono, cursore,
+// onde, celle agitate o effetti casuali) l'immagine è identica alla precedente e
+// non si ridisegna. Qualsiasi modifica dal pannello forza un nuovo disegno.
+let needsDraw = true, idle = false;
+function isStill() {
+  return SPEED === 0 && VARY === 0 && !snd.active && snd.kick < 0.01 && !mouse && !shocks.length &&
+         agitated === 0 && !(fx.glitch.on && fx.glitch.v > 0) && !(fx.crt.on && fx.crt.v > 0);
+}
+
+let paused = false, last = 0;
+function loop(t) {
+  if (!paused && t - last > 50) {                       // ~20 fotogrammi al secondo
+    idle = !needsDraw && isStill();
+    if (!idle) {
+      const t0 = performance.now();
+      draw(t);
+      noteFrame(t, performance.now() - t0);
+      needsDraw = false;
+    }
+    last = t;
+    autoTune(t);
+  }
+  updateStats(t);
+  requestAnimationFrame(loop);
+}
+
+// Qualità automatica: una volta al secondo controlla il tempo medio di disegno
+let tuneLast = 0, tuneChanged = 0;
+function autoTune(t) {
+  if (t - tuneLast < 1000) return;
+  tuneLast = t;
+  if (!autoQ || recorder || idle || drawMs.length < 5) return;
+  const ms = drawMs.reduce((a, b) => a + b, 0) / drawMs.length;
+  const cur = currentQuality(), dpr = qualityDpr(cur);
+  let k = Q_LEVELS.indexOf(cur);
+  if (ms > 40) {                                       // troppo lento: scende (saltando livelli identici)
+    while (k > 0 && qualityDpr(Q_LEVELS[k - 1]) >= dpr) k--;
+    if (k > 0) { autoLevel = Q_LEVELS[k - 1]; tuneChanged = t; fit(); needsDraw = true; }
+  } else if (ms < 15 && autoLevel && t - tuneChanged > 5000) {   // di nuovo fluida: risale
+    autoLevel = Q_LEVELS[k + 1] === quality ? null : Q_LEVELS[k + 1];
+    tuneChanged = t; fit(); needsDraw = true;
+  }
+}
+
+// ---- Statistiche (riquadro in alto a destra) ----
+// FPS = fotogrammi disegnati nell'ultimo secondo; "Disegno" = tempo medio per
+// fotogramma (il limite per tenere 20 FPS è 50 ms). Il riquadro si aggiorna
+// 4 volte al secondo, non a ogni fotogramma.
+const statsEl = document.getElementById("stats");
+const st = id => document.getElementById(id);
+const frameTimes = [], drawMs = [], fpsHistory = [];
+let statsLast = 0;
+function noteFrame(t, ms) {
+  frameTimes.push(t);
+  drawMs.push(ms);
+  while (frameTimes.length && t - frameTimes[0] >= 1000) { frameTimes.shift(); drawMs.shift(); }
+}
+function setStat(id, text, level) {
+  const el = st(id);
+  el.textContent = text;
+  el.className = level || "";
+}
+function updateStats(t) {
+  if (statsEl.classList.contains("hidden") || t - statsLast < 250) return;
+  statsLast = t;
+  while (frameTimes.length && t - frameTimes[0] >= 1000) { frameTimes.shift(); drawMs.shift(); }
+  const fps = paused ? 0 : frameTimes.length;
+  const ms = drawMs.length ? drawMs.reduce((a, b) => a + b, 0) / drawMs.length : 0;
+  const stopped = paused || idle;
+  st("stFps").textContent = fps;
+  st("stFps").style.color = stopped ? "#666" : fps < 12 ? "#e5484d" : fps < 18 ? "#e5a84d" : "";
+  setStat("stMs", stopped ? "–" : ms.toFixed(1) + " ms", ms > 50 ? "bad" : ms > 35 ? "warn" : "");
+  setStat("stAnim", timing.anim.toFixed(1) + " ms", "sub");
+  setStat("stCellsMs", timing.cells.toFixed(1) + " ms", "sub");
+  setStat("stPost", timing.post.toFixed(1) + " ms", "sub");
+  const active = fpsHistory.filter(v => v > 0);           // ultimi 10 s, senza pause e fermi
+  setStat("stFpsRange", active.length ? `${Math.min(...active)} / ${Math.round(active.reduce((a, b) => a + b, 0) / active.length)}` : "–");
+  setStat("stRes", `${cv.width}×${cv.height} · ${(cv.width / boxW).toFixed(2)}×`);
+  const q = currentQuality();
+  setStat("stQ", q + (autoQ ? (q !== quality ? " (auto ↓)" : " (auto)") : ""), q !== quality ? "warn" : "");
+  setStat("stAgit", total ? Math.round(agitated / total * 100) + "%" : "–");
+  setStat("stGrid", `${D.w} × ${D.h}`);
+  setStat("stCells", total.toLocaleString("it-IT"));
+  setStat("stStyle", document.querySelector(`.styles button[data-style="${style}"]`).textContent);
+  setStat("stPal", D.color ? document.querySelector(`.palettes button[data-pal="${palette}"]`).textContent : "B/N");
+  setStat("stShocks", String(shocks.length));
+  const src = [micStream && "mic", !audioEl.paused && "audio"].filter(Boolean).join(" + ");
+  setStat("stSound", snd.active ? `${src} ${Math.round(snd.rms * 100)}%` : "spento");
+  setStat("stState", recorder ? "● Registrazione" : paused ? "In pausa" : !srcImg && !D.src ? "Senza immagine"
+          : idle ? "Ferma (risparmio)" : "In esecuzione", recorder ? "bad" : paused || idle ? "warn" : "");
+  fpsHistory.push(fps);
+  if (fpsHistory.length > 40) fpsHistory.shift();
+  drawSpark();
+}
+// Andamento degli FPS negli ultimi 10 secondi; la linea tratteggiata è l'obiettivo di 20
+function drawSpark() {
+  const c = st("stSpark"), dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth, h = c.clientHeight;
+  if (c.width !== Math.round(w * dpr)) { c.width = Math.round(w * dpr); c.height = Math.round(h * dpr); }
+  const g = c.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const y = v => h - 1 - Math.min(v, 25) / 25 * (h - 2);
+  g.strokeStyle = "#444";
+  g.setLineDash([2, 3]);
+  g.beginPath(); g.moveTo(0, y(20)); g.lineTo(w, y(20)); g.stroke();
+  g.setLineDash([]);
+  g.strokeStyle = "#eee";
+  g.lineWidth = 1.2;
+  g.beginPath();
+  fpsHistory.forEach((v, k) => {
+    const x = w - (fpsHistory.length - 1 - k) * (w / 39);
+    k ? g.lineTo(x, y(v)) : g.moveTo(x, y(v));
+  });
+  g.stroke();
+}
+function toggleStats() { statsEl.classList.toggle("hidden"); }
+
+// Pannello Prestazioni: livello massimo di qualità e regolazione automatica
+const qBtns = document.querySelectorAll(".quality button"), autoBtn = document.getElementById("autoQ");
+function showQuality() {
+  qBtns.forEach(b => b.setAttribute("aria-pressed", b.dataset.q === quality));
+  autoBtn.setAttribute("aria-pressed", autoQ);
+}
+qBtns.forEach(b => b.addEventListener("click", () => {
+  quality = b.dataset.q;
+  autoLevel = null;                    // nuova scelta: l'automatico riparte da qui
+  showQuality();
+  fit();
+  draw(performance.now());
+}));
+autoBtn.addEventListener("click", () => {
+  autoQ = !autoQ;
+  if (!autoQ && autoLevel) { autoLevel = null; fit(); draw(performance.now()); }
+  showQuality();
+});
+showQuality();
+// Ogni modifica dal pannello va disegnata subito, anche quando l'immagine è ferma
+const panelEl = document.getElementById("panel");
+panelEl.addEventListener("input", () => { needsDraw = true; });
+panelEl.addEventListener("click", () => { needsDraw = true; });
+document.getElementById("statsClose").addEventListener("click", toggleStats);
+function togglePause() { paused = !paused; }
+function toCells(e) {
+  const r = cv.getBoundingClientRect();
+  return { x: (e.clientX - r.left - ox) / cw, y: (e.clientY - r.top - oy) / ch };
+}
+// Pannello: gli slider cambiano i parametri mentre l'animazione gira
+function bindSlider(id, get, set) {
+  const input = document.getElementById(id), out = document.getElementById(id + "Val");
+  input.value = get();
+  out.textContent = input.value;   // il valore effettivo dello slider, dopo eventuali arrotondamenti
+  input.addEventListener("input", () => { set(+input.value); out.textContent = input.value; });
+}
+bindSlider("radius", () => RADIUS, v => { RADIUS = v; });
+bindSlider("push", () => PUSH, v => { PUSH = v; });
+bindSlider("speed", () => SPEED, v => { SPEED = v; });
+bindSlider("vary", () => VARY, v => { VARY = v; });
+bindSlider("size", () => SIZE, v => { SIZE = v; applyFont(); });
+// Quantità segni = quanti caratteri per riga; l'immagine viene riconvertita da capo,
+// al massimo una volta per fotogramma mentre si trascina lo slider
+let colsWanted = 0, colsPending = 0;   // colsPending: scelta fatta prima di avere un'immagine
+bindSlider("cols", () => D.w, v => {
+  if (!srcImg) { colsPending = v; return; }   // varrà per la prima immagine che arriva
+  if (!colsWanted) requestAnimationFrame(() => { buildGrid(srcImg, colsWanted); colsWanted = 0; });
+  colsWanted = v;
+});
+bindSlider("sens", () => SENS, v => { SENS = v; });
+// Effetti sonori: interruttore on/off + slider dell'intensità
+document.querySelectorAll(".row.fx").forEach(row => {
+  const key = row.dataset.fx, sw = row.querySelector(".switch");
+  bindSlider(key, () => fx[key].v, v => { fx[key].v = v; });
+  const show = () => { sw.setAttribute("aria-pressed", fx[key].on); row.classList.toggle("off", !fx[key].on); };
+  sw.addEventListener("click", () => { fx[key].on = !fx[key].on; show(); });
+  show();
+});
+// Onda: bassi, medi e alti si accendono e spengono singolarmente
+document.querySelectorAll(".bands button[data-band]").forEach(btn => {
+  const band = BANDS[btn.dataset.band];
+  const show = () => btn.setAttribute("aria-pressed", band.on);
+  btn.addEventListener("click", () => { band.on = !band.on; show(); });
+  show();
+});
+
+// Salva il fotogramma corrente del canvas (solo l'arte, senza il pannello)
+function fileName(ext) {
+  const d = new Date(), p = v => String(v).padStart(2, "0");
+  return `ascii-art-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}` +
+         `-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.${ext}`;
+}
+function download(blob, name) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+function saveFrame() {
+  cv.toBlob(blob => download(blob, fileName("png")), "image/png");
+}
+document.getElementById("save").addEventListener("click", saveFrame);
+
+// Registrazione video del canvas (solo l'arte, senza il pannello), con l'audio
+// del microfono o del file se acceso. Usa MP4 se il browser lo supporta, altrimenti WebM.
+const recBtn = document.getElementById("rec");
+let recorder = null, recTimer = null;
+function pickFormat(withAudio) {
+  const formats = [
+    ...(withAudio ? [["video/mp4;codecs=avc1,mp4a.40.2", "mp4"], ["video/webm;codecs=vp9,opus", "webm"]] : []),
+    ["video/mp4;codecs=avc1", "mp4"], ["video/mp4", "mp4"],
+    ["video/webm;codecs=vp9", "webm"], ["video/webm", "webm"],
+  ];
+  return formats.find(([type]) => MediaRecorder.isTypeSupported(type));
+}
+function resetRecButton() {
+  recorder = null;
+  clearInterval(recTimer);
+  recBtn.classList.remove("on");
+  recBtn.textContent = "Registra";
+}
+function toggleRecording() {
+  if (recorder) { recorder.stop(); return; }
+  if (!window.MediaRecorder || !cv.captureStream) {
+    alert("Questo browser non supporta la registrazione video.");
+    return;
+  }
+  const format = pickFormat(!!audioCtx);
+  if (!format) {
+    alert("Questo browser non supporta nessun formato video registrabile (MP4 o WebM).");
+    return;
+  }
+  const [type, ext] = format;
+  const stream = cv.captureStream(30);
+  if (audioCtx) recDest.stream.getAudioTracks().forEach(tr => stream.addTrack(tr));
+  const chunks = [], start = performance.now();
+  try {
+    recorder = new MediaRecorder(stream, { mimeType: type, videoBitsPerSecond: 8e6 });
+    recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+    recorder.onerror = e => alert("Errore durante la registrazione: " + (e.error ? e.error.message : ""));
+    recorder.onstop = () => {
+      // Ferma la cattura del canvas; l'audio di recDest resta per le prossime registrazioni
+      stream.getVideoTracks().forEach(tr => tr.stop());
+      if (chunks.length) download(new Blob(chunks, { type }), fileName(ext));
+      resetRecButton();
+      fit();                     // il canvas torna a seguire la finestra
+      draw(performance.now());
+    };
+    recorder.start(1000);
+  } catch (err) {
+    stream.getVideoTracks().forEach(tr => tr.stop());
+    resetRecButton();
+    alert("Impossibile avviare la registrazione: " + err.message);
+    return;
+  }
+  recBtn.classList.add("on");
+  const tick = () => {
+    const s = Math.floor((performance.now() - start) / 1000);
+    recBtn.textContent = `Ferma ${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+  };
+  tick();
+  recTimer = setInterval(tick, 250);
+}
+recBtn.addEventListener("click", toggleRecording);
+
+// Pannello: si chiude con la × e si riapre con "Controlli" (o col tasto H)
+const panel = document.getElementById("panel");
+function togglePanel() { panel.classList.toggle("hidden"); }
+document.getElementById("close").addEventListener("click", togglePanel);
+document.getElementById("open").addEventListener("click", togglePanel);
+
+// Converte un'immagine in ASCII direttamente nel browser con "cols" segni per riga;
+// l'altezza è ricavata dalle proporzioni. Serve sia per cambiare immagine sia per
+// cambiare la quantità di segni (l'immagine originale è incorporata nella pagina).
+let srcImg = null;
+function buildGrid(img, cols) {
+  const h = Math.max(1, Math.round(img.naturalHeight / img.naturalWidth * cols / CELL));
+  const off = document.createElement("canvas");
+  off.width = cols;
+  off.height = h;
+  const o = off.getContext("2d");
+  o.fillStyle = D.bg;                 // le zone trasparenti prendono il colore di sfondo
+  o.fillRect(0, 0, cols, h);
+  o.imageSmoothingQuality = "high";
+  o.drawImage(img, 0, 0, cols, h);
+  const px = o.getImageData(0, 0, cols, h).data;
+  D.w = cols;
+  D.h = h;
+  D.lum = new Array(cols * h);
+  D.rgb = new Array(cols * h * 3);
+  for (let i = 0; i < cols * h; i++) {
+    const r = px[i*4], g = px[i*4+1], b = px[i*4+2];
+    D.lum[i] = Math.round(r * 0.299 + g * 0.587 + b * 0.114);   // stessa formula di Pillow
+    D.rgb[i*3] = r; D.rgb[i*3+1] = g; D.rgb[i*3+2] = b;
+  }
+  // Luminosità a risoluzione 2×4 per cella, per i puntini dello stile Braille
+  const sub = document.createElement("canvas");
+  sub.width = cols * 2;
+  sub.height = h * 4;
+  const so = sub.getContext("2d");
+  so.fillStyle = D.bg;
+  so.fillRect(0, 0, sub.width, sub.height);
+  so.imageSmoothingQuality = "high";
+  so.drawImage(img, 0, 0, sub.width, sub.height);
+  const sp = so.getImageData(0, 0, sub.width, sub.height).data;
+  D.sub = new Uint8Array(sub.width * sub.height);
+  for (let i = 0; i < D.sub.length; i++)
+    D.sub[i] = Math.round(sp[i*4] * 0.299 + sp[i*4+1] * 0.587 + sp[i*4+2] * 0.114);
+  setPixels();
+  colDy = new Float32Array(D.w);
+  if (audioCtx) mapColumns();
+  shocks.length = 0;
+  mouse = null;
+  fit();
+  draw(performance.now());
+}
+if (D.src) {
+  const img = new Image();
+  img.onload = () => {
+    srcImg = img;
+    buildGrid(srcImg, D.w);   // ricalcola anche i dati del Braille, assenti nella versione di Python
+  };
+  img.onerror = () => console.warn("Immagine incorporata non leggibile: Braille, Quantità segni e cambio forma delle celle non disponibili.");
+  img.src = D.src;
+}
+
+// Selettore dello stile; se cambia la forma delle celle, l'immagine viene ricampionata.
+// Le opzioni (.opts) dello stile scelto compaiono, le altre si nascondono.
+const styleBtns = document.querySelectorAll(".styles button");
+function setStyle(name) {
+  style = name;
+  styleBtns.forEach(b => b.setAttribute("aria-pressed", b.dataset.style === name));
+  document.querySelectorAll(".opts[data-for]").forEach(o => o.classList.toggle("show", o.dataset.for === name));
+  document.body.style.background = STYLES[name].bg();
+  const aspect = STYLES[name].aspect;
+  if (aspect !== CELL) {
+    CELL = aspect;
+    if (srcImg) { buildGrid(srcImg, D.w); return; }
+    // Originale non ancora pronto: la griglia resta, ma misure e contorni seguono la nuova forma
+    fit();
+    findEdges();
+  }
+  draw(performance.now());
+}
+styleBtns.forEach(b => b.addEventListener("click", () => setStyle(b.dataset.style)));
+styleBtns.forEach(b => b.setAttribute("aria-pressed", b.dataset.style === style));
+function cycleStyle(step) {
+  const names = [...styleBtns].map(b => b.dataset.style);
+  setStyle(names[(names.indexOf(style) + step + names.length) % names.length]);
+}
+
+// Opzioni degli stili
+const phrase = document.getElementById("phrase");
+// La frase diventa un array di caratteri interi: così anche emoji e simboli speciali
+// (che in JavaScript occupano due "unità") restano integri.
+const readPhrase = () => { const c = [...phrase.value.replace(/\\s+/g, "")]; return c.length ? c : [..."ASCII"]; };
+phrase.addEventListener("input", () => { TEXT = readPhrase(); });
+TEXT = readPhrase();
+bindSlider("edge", () => EDGE, v => { EDGE = v; });
+bindSlider("levels", () => LEVELS, v => { LEVELS = v; });
+
+// Palette: solo con l'immagine a colori (--color); in bianco e nero il gruppo è nascosto
+const palBtns = document.querySelectorAll(".palettes button");
+function setPalette(name) {
+  palette = name;
+  palBtns.forEach(b => b.setAttribute("aria-pressed", b.dataset.pal === name));
+  document.querySelectorAll(".opts[data-pal-for]").forEach(o => o.classList.toggle("show", o.dataset.palFor === name));
+  applyPalette();
+  document.body.style.background = STYLES[style].bg();
+  draw(performance.now());
+}
+palBtns.forEach(b => b.addEventListener("click", () => setPalette(b.dataset.pal)));
+palBtns.forEach(b => b.setAttribute("aria-pressed", b.dataset.pal === palette));
+const hex = s => [1, 3, 5].map(k => parseInt(s.slice(k, k + 2), 16));
+for (const [id, key] of [["duoA", "a"], ["duoB", "b"]])
+  document.getElementById(id).addEventListener("input", e => { duo[key] = hex(e.target.value); setPalette("duotone"); });
+if (!D.color) document.getElementById("paletteGroup").style.display = "none";
+
+const imageBtn = document.getElementById("image"), imageInput = document.getElementById("imageFile");
+function pickImage() { imageInput.value = ""; imageInput.click(); }
+imageBtn.addEventListener("click", pickImage);
+// Pagina generata senza foto (D.src assente): invito a sceglierla, finché non arriva
+const emptyEl = document.getElementById("empty");
+document.getElementById("emptyPick").addEventListener("click", pickImage);
+if (!D.src) emptyEl.classList.add("show");
+imageInput.addEventListener("change", () => {
+  const file = imageInput.files[0];
+  if (!file) return;
+  const url = URL.createObjectURL(file), img = new Image();
+  img.onload = () => {
+    URL.revokeObjectURL(url);           // l'immagine è già decodificata: il file non serve più
+    if (!img.naturalWidth || !img.naturalHeight) {   // es. SVG senza dimensioni
+      alert("Questa immagine non ha dimensioni leggibili. Prova con un file JPG, PNG, WebP o GIF.");
+      return;
+    }
+    srcImg = img;
+    buildGrid(img, colsPending || D.w);
+    colsPending = 0;
+    imageBtn.textContent = file.name;
+    imageBtn.title = file.name;
+    emptyEl.classList.remove("show");
+  };
+  img.onerror = () => {
+    URL.revokeObjectURL(url);
+    alert("Impossibile aprire questa immagine. Prova con un file JPG, PNG, WebP o GIF.");
+  };
+  img.src = url;
+});
+
+addEventListener("keydown", e => {
+  const target = e.target instanceof Element ? e.target : document.body;
+  if (target.matches("input[type=text]")) return;   // mentre scrivi la frase, niente scorciatoie
+  if (e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;   // Ctrl+S, Ctrl+R… restano al browser
+  const onSlider = target.matches("input[type=range]");
+  if (e.code === "ArrowRight" && !onSlider) cycleStyle(1);
+  else if (e.code === "ArrowLeft" && !onSlider) cycleStyle(-1);
+  else if (e.code === "Space") { e.preventDefault(); togglePause(); }
+  else if (e.code === "KeyS") saveFrame();
+  else if (e.code === "KeyR") toggleRecording();
+  else if (e.code === "KeyM") toggleMic();
+  else if (e.code === "KeyH") togglePanel();
+  else if (e.code === "KeyF") toggleStats();
+  else if (e.code === "KeyI") pickImage();
+  else if (/^Digit[1-9]$/.test(e.code)) setStyle(styleBtns[+e.code.slice(5) - 1].dataset.style);
+});
+cv.addEventListener("pointermove", e => { mouse = toCells(e); });
+cv.addEventListener("pointerleave", () => { mouse = null; });
+cv.addEventListener("pointerdown", e => {
+  const p = toCells(e);
+  addShock(p.x, p.y, performance.now());
+  touchArea(p.x, p.y, RADIUS * 2.5, 1);
+});
+addEventListener("resize", () => { fit(); draw(performance.now()); });
+fit();
+requestAnimationFrame(loop);
+</script></body></html>
+"""
+
+
+def embed_source(path, max_side=1200):
+    """L'immagine originale (ridotta) come data URL JPEG, per riconvertirla nel browser."""
+    src = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
+    src.thumbnail((max_side, max_side), Image.LANCZOS)
+    buf = io.BytesIO()
+    src.save(buf, "JPEG", quality=88)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def render_html(img, chars, color, invert, source):
+    """Pagina HTML animata: i caratteri cambiano di continuo e si adattano alla finestra."""
+    data = {
+        "w": img.width,
+        "h": img.height,
+        "chars": chars,
+        "lum": list(img.convert("L").tobytes()),
+        "rgb": list(img.tobytes()) if color else [],
+        "color": color,
+        "invert": invert,
+        "fg": "#000",
+        "bg": "#000" if color else "#fff",
+        "src": source,
+    }
+    return (HTML_TEMPLATE
+            .replace("__BG__", data["bg"])
+            .replace("__DATA__", json.dumps(data, ensure_ascii=False, separators=(",", ":"))))
+
+
+def positive_width(text):
+    """Larghezza in caratteri: un intero da 1 a 1000, altrimenti un messaggio chiaro."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{text}' non è un numero intero")
+    if not 1 <= value <= 1000:
+        raise argparse.ArgumentTypeError("la larghezza deve essere tra 1 e 1000 caratteri")
+    return value
+
+
+def blank_image(width, color, invert):
+    """Griglia vuota per la pagina senza foto: un'immagine 16:9 tutta "senza inchiostro"
+    (nera a colori, bianca in bianco e nero; il contrario con --invert)."""
+    height = max(1, round(width * 9 / 16 * CHAR_ASPECT))
+    fill = (0, 0, 0) if color != invert else (255, 255, 255)
+    return Image.new("RGB", (width, height), fill)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Trasforma un'immagine in ASCII art.")
+    parser.add_argument("immagine", nargs="?",
+                        help="percorso dell'immagine (jpg, png, ...); facoltativo con --html: "
+                             "senza foto la pagina parte vuota e la scegli dal pannello")
+    parser.add_argument("-w", "--width", type=positive_width, default=100,
+                        help="larghezza in caratteri, da 1 a 1000 (default 100)")
+    parser.add_argument("-c", "--charset", choices=CHARSETS, default="semplice",
+                        help="set di caratteri da usare")
+    parser.add_argument("-i", "--invert", action="store_true",
+                        help="inverte chiari/scuri (utile su sfondo bianco)")
+    parser.add_argument("--color", action="store_true",
+                        help="usa i colori originali (terminale o HTML)")
+    parser.add_argument("-o", "--output", help="salva il risultato in un file .txt")
+    parser.add_argument("--html", help="salva il risultato in un file .html")
+    args = parser.parse_args()
+
+    chars = CHARSETS[args.charset]
+    # Su sfondo nero (modalità colore) i punti chiari devono avere i caratteri più densi
+    html_chars = chars[::-1] if args.invert != args.color else chars
+
+    # Senza foto si può creare solo la pagina HTML, dove l'immagine si sceglie dal pannello
+    if args.immagine is None:
+        if not args.html or args.output:
+            parser.error("senza immagine serve --html (es. --html risultato.html, senza -o), "
+                         "oppure indica una foto")
+        img = blank_image(args.width, args.color, args.invert)
+        page = render_html(img, html_chars, args.color, args.invert, None)
+        Path(args.html).write_text(page, encoding="utf-8")
+        print(f"Salvato in {args.html} (nessuna foto: scegline una dal pannello della pagina)")
+        return
+
+    try:
+        img = load_image(args.immagine, args.width)
+    except (FileNotFoundError, OSError) as e:
+        sys.exit(f"Impossibile aprire l'immagine: {e}")
+
+    rows = to_ascii(img, chars, args.invert)
+
+    if args.output:
+        Path(args.output).write_text(render_plain(rows), encoding="utf-8")
+        print(f"Salvato in {args.output}")
+    if args.html:
+        page = render_html(img, html_chars, args.color, args.invert, embed_source(args.immagine))
+        Path(args.html).write_text(page, encoding="utf-8")
+        print(f"Salvato in {args.html}")
+    if not args.output and not args.html:
+        if sys.platform == "win32":
+            sys.stdout.reconfigure(encoding="utf-8")
+            import os
+            os.system("")  # abilita i colori ANSI nel terminale di Windows
+        print(render_terminal_color(rows) if args.color else render_plain(rows))
+
+
+if __name__ == "__main__":
+    main()
