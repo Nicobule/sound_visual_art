@@ -1,4 +1,4 @@
-# ASCII Art animata
+# Sound Visual Art
 
 Trasforma qualsiasi immagine in arte   **animata e interattiva**, direttamente nel browser.
 I segni cambiano di continuo, reagiscono al cursore e possono vibrare a ritmo di musica
